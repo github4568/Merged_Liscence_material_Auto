@@ -1,357 +1,296 @@
 import cv2
 import numpy as np
 from pathlib import Path
+from ultralytics import YOLO
 
-class DirectStackTracker:
-    def __init__(self, video_path, num_examples=4):
+class YOLOStackTracker:
+    def __init__(self, video_path, model_path="stack.pt", conf_threshold=0.5, iou_threshold=0.5):
+        """
+        Initialize tracker with fine-tuned YOLO model
+        
+        Args:
+            video_path: Path to input video
+            model_path: Path to fine-tuned YOLO model (stack.pt)
+            conf_threshold: Confidence threshold for detections (0-1)
+            iou_threshold: IoU threshold for NMS
+        """
         self.video_path = video_path
-        self.num_examples = num_examples
-        self.manual_labels = []
-        self.drawing = False
-        self.start_point = None
-        self.current_frame = None
-        self.temp_frame = None
-        self.trackers = []
+        self.model_path = model_path
+        self.conf_threshold = conf_threshold
+        self.iou_threshold = iou_threshold
+        self.model = None
+        self.tracked_objects = {}
+        self.next_id = 1
         
-    def mouse_callback(self, event, x, y, flags, param):
-        """Handle mouse events for bounding box drawing"""
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.start_point = (x, y)
-            self.temp_frame = self.current_frame.copy()
+    def load_model(self):
+        """Load the fine-tuned YOLO model"""
+        print(f"🔧 Loading fine-tuned model: {self.model_path}")
+        try:
+            self.model = YOLO(self.model_path)
+            print("✅ Model loaded successfully!")
+            print(f"   Model classes: {self.model.names}")
+        except Exception as e:
+            print(f"❌ Error loading model: {e}")
+            raise
+    
+    def calculate_iou(self, box1, box2):
+        """Calculate IoU between two bounding boxes"""
+        x1_min, y1_min, x1_max, y1_max = box1
+        x2_min, y2_min, x2_max, y2_max = box2
+        
+        # Intersection area
+        inter_x_min = max(x1_min, x2_min)
+        inter_y_min = max(y1_min, y2_min)
+        inter_x_max = min(x1_max, x2_max)
+        inter_y_max = min(y1_max, y2_max)
+        
+        inter_area = max(0, inter_x_max - inter_x_min) * max(0, inter_y_max - inter_y_min)
+        
+        # Union area
+        box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+        box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+        union_area = box1_area + box2_area - inter_area
+        
+        return inter_area / union_area if union_area > 0 else 0
+    
+    def match_detections_to_tracks(self, detections, max_distance=50):
+        """
+        Match current detections to existing tracked objects
+        
+        Args:
+            detections: List of current frame detections
+            max_distance: Maximum distance for matching
+        """
+        matched_ids = set()
+        unmatched_detections = []
+        
+        for det in detections:
+            det_box = det['bbox']
+            det_center = ((det_box[0] + det_box[2]) / 2, (det_box[1] + det_box[3]) / 2)
             
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if self.drawing:
-                self.temp_frame = self.current_frame.copy()
-                cv2.rectangle(self.temp_frame, self.start_point, (x, y), (0, 255, 0), 2)
+            best_match_id = None
+            best_iou = 0
+            
+            # Try to match with existing tracks
+            for track_id, track_info in self.tracked_objects.items():
+                if track_id in matched_ids:
+                    continue
                 
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.drawing = False
-            end_point = (x, y)
+                track_box = track_info['bbox']
+                iou = self.calculate_iou(det_box, track_box)
+                
+                if iou > 0.3 and iou > best_iou:  # IoU threshold for matching
+                    best_iou = iou
+                    best_match_id = track_id
             
-            # Store the bounding box
-            bbox = {
-                'x1': min(self.start_point[0], end_point[0]),
-                'y1': min(self.start_point[1], end_point[1]),
-                'x2': max(self.start_point[0], end_point[0]),
-                'y2': max(self.start_point[1], end_point[1])
+            if best_match_id is not None:
+                # Update existing track
+                self.tracked_objects[best_match_id]['bbox'] = det_box
+                self.tracked_objects[best_match_id]['class'] = det['class']
+                self.tracked_objects[best_match_id]['confidence'] = det['confidence']
+                self.tracked_objects[best_match_id]['lost_frames'] = 0
+                matched_ids.add(best_match_id)
+                det['id'] = best_match_id
+            else:
+                # New detection
+                unmatched_detections.append(det)
+        
+        # Add new tracks for unmatched detections
+        for det in unmatched_detections:
+            self.tracked_objects[self.next_id] = {
+                'bbox': det['bbox'],
+                'class': det['class'],
+                'confidence': det['confidence'],
+                'lost_frames': 0
             }
-            self.manual_labels[-1]['bboxes'].append(bbox)
-            
-            # Draw final box
-            cv2.rectangle(self.current_frame, self.start_point, end_point, (0, 255, 0), 2)
-            cv2.putText(self.current_frame, "Stack", self.start_point, 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            det['id'] = self.next_id
+            self.next_id += 1
+        
+        # Remove tracks that have been lost for too long
+        lost_threshold = 30  # frames
+        tracks_to_remove = []
+        for track_id, track_info in self.tracked_objects.items():
+            if track_id not in matched_ids:
+                track_info['lost_frames'] += 1
+                if track_info['lost_frames'] > lost_threshold:
+                    tracks_to_remove.append(track_id)
+        
+        for track_id in tracks_to_remove:
+            del self.tracked_objects[track_id]
     
-    def extract_sample_frames(self):
-        """Extract evenly spaced frames from video"""
-        cap = cv2.VideoCapture(self.video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    def detect_and_track(self, output_path=None, display_size=(1280, 720)):
+        """
+        Run detection and tracking on video
         
-        print(f"🔍 Video has {total_frames} frames")
-        
-        # Get evenly distributed frames
-        frame_indices = np.linspace(0, total_frames-1, self.num_examples * 3, dtype=int)
-        
-        candidate_frames = []
-        for idx in frame_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ret, frame = cap.read()
-            if ret:
-                candidate_frames.append({
-                    'frame_idx': idx,
-                    'frame': frame.copy()
-                })
-        
-        cap.release()
-        return candidate_frames
-    
-    def manual_labeling_phase(self):
-        """Interactive manual labeling window"""
-        all_sample_frames = self.extract_sample_frames()
-        
-        print(f"\n📝 Manual Labeling Phase - Need {self.num_examples} labeled frames")
-        print("Instructions:")
-        print("  - Click and drag to draw bounding box around stack/material")
-        print("  - Press SPACE to finish labeling current frame")
-        print("  - Press ESC to skip frame")
-        
-        frame_pool_idx = 0
-        labeled_count = 0
-        
-        while labeled_count < self.num_examples and frame_pool_idx < len(all_sample_frames):
-            sample = all_sample_frames[frame_pool_idx]
-            
-            # Resize to 640x640
-            original_frame = sample['frame']
-            resized_frame = cv2.resize(original_frame, (640, 640))
-            
-            self.current_frame = resized_frame.copy()
-            self.temp_frame = self.current_frame.copy()
-            
-            # Prepare to store labels
-            temp_label = {
-                'frame_idx': sample['frame_idx'],
-                'bboxes': []
-            }
-            
-            window_name = f"Label Frame {labeled_count+1}/{self.num_examples} (640x640)"
-            cv2.namedWindow(window_name)
-            cv2.setMouseCallback(window_name, self.mouse_callback)
-            
-            label_idx = len(self.manual_labels)
-            self.manual_labels.append(temp_label)
-            
-            print(f"\n📸 Frame {frame_pool_idx + 1} (need {self.num_examples - labeled_count} more)")
-            
-            while True:
-                display_frame = self.temp_frame if self.drawing else self.current_frame
-                
-                cv2.putText(display_frame, f"Labeled: {labeled_count}/{self.num_examples}", 
-                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                cv2.putText(display_frame, "SPACE: Done | ESC: Skip", 
-                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                cv2.imshow(window_name, display_frame)
-                
-                key = cv2.waitKey(1) & 0xFF
-                if key == 32:  # SPACE
-                    if len(self.manual_labels[label_idx]['bboxes']) > 0:
-                        print(f"✅ Labeled with {len(self.manual_labels[label_idx]['bboxes'])} boxes")
-                        labeled_count += 1
-                    else:
-                        print("⚠️ No boxes, skipping...")
-                        self.manual_labels.pop(label_idx)
-                    break
-                elif key == 27:  # ESC
-                    print("⏭️ Skipped")
-                    self.manual_labels.pop(label_idx)
-                    break
-            
-            cv2.destroyWindow(window_name)
-            frame_pool_idx += 1
-        
-        print(f"\n✅ Got {len(self.manual_labels)} labeled frames!")
-        self.show_understood_popup()
-    
-    def show_understood_popup(self):
-        """Show confirmation"""
-        popup = np.zeros((250, 500, 3), dtype=np.uint8)
-        popup[:] = (40, 40, 40)
-        
-        cv2.putText(popup, "UNDERSTOOD!", (120, 70), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
-        cv2.putText(popup, f"Labeled {len(self.manual_labels)} frames", (80, 120), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(popup, "Starting tracking...", (90, 160), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(popup, "Press any key", (150, 200), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        
-        cv2.imshow("Status", popup)
-        cv2.waitKey(0)
-        cv2.destroyWindow("Status")
-    
-    def initialize_trackers(self, frame):
-        """Store templates from labeled boxes"""
-        self.trackers = []
-        
-        for label in self.manual_labels:
-            for bbox in label['bboxes']:
-                x1, y1, x2, y2 = bbox['x1'], bbox['y1'], bbox['x2'], bbox['y2']
-                
-                # Extract template from frame
-                template = frame[y1:y2, x1:x2].copy()
-                
-                self.trackers.append({
-                    'template': template,
-                    'last_pos': (x1, y1, x2, y2),
-                    'id': len(self.trackers) + 1,
-                    'active': True
-                })
-        
-        print(f"🎯 Initialized {len(self.trackers)} trackers")
-
-    def track_and_display(self):
-        """Play video with template matching tracking"""
+        Args:
+            output_path: Optional path to save output video
+            display_size: Size for display window (width, height)
+        """
         cap = cv2.VideoCapture(self.video_path)
         
-        print("\n🎬 Playing video with tracked stacks...")
-        print("Press 'q' to quit")
-        
-        # Find first labeled frame
-        first_labeled_frame_idx = min([label['frame_idx'] for label in self.manual_labels])
-        cap.set(cv2.CAP_PROP_POS_FRAMES, first_labeled_frame_idx)
-        
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Couldn't read video")
+        if not cap.isOpened():
+            print("❌ Error opening video file")
             return
         
-        frame = cv2.resize(frame, (640, 640))
+        # Get video properties
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # Initialize with templates
-        self.initialize_trackers(frame)
+        print(f"\n📹 Video Info:")
+        print(f"   Frames: {total_frames}")
+        print(f"   FPS: {fps}")
+        print(f"   Resolution: {width}x{height}")
+        print(f"   Display size: {display_size[0]}x{display_size[1]}")
         
-        frame_count = first_labeled_frame_idx
+        # Setup video writer if output path provided
+        writer = None
+        if output_path:
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, display_size)
+            print(f"💾 Saving output to: {output_path}")
+        
+        print("\n🎬 Starting detection and tracking...")
+        print("   Press 'q' to quit")
+        print("   Press 'p' to pause/resume")
+        print("   Press 's' to save current frame")
+        
+        frame_count = 0
+        paused = False
+        
+        # Color palette for different classes
+        colors = [
+            (0, 255, 0),    # Green
+            (255, 0, 0),    # Blue
+            (0, 0, 255),    # Red
+            (255, 255, 0),  # Cyan
+            (255, 0, 255),  # Magenta
+            (0, 255, 255),  # Yellow
+        ]
         
         while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            frame_count += 1
-            frame = cv2.resize(frame, (640, 640))
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # Track each template
-            active_count = 0
-            for tracker_obj in self.trackers:
-                if tracker_obj['active']:
-                    template = cv2.cvtColor(tracker_obj['template'], cv2.COLOR_BGR2GRAY)
-                    
-                    # Get search region around last position
-                    x1, y1, x2, y2 = tracker_obj['last_pos']
-                    search_margin = 50
-                    
-                    sx1 = max(0, x1 - search_margin)
-                    sy1 = max(0, y1 - search_margin)
-                    sx2 = min(640, x2 + search_margin)
-                    sy2 = min(640, y2 + search_margin)
-                    
-                    search_region = frame_gray[sy1:sy2, sx1:sx2]
-                    
-                    if search_region.size > 0 and template.size > 0:
-                        # Template matching
-                        result = cv2.matchTemplate(search_region, template, cv2.TM_CCOEFF_NORMED)
-                        min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
-                        
-                        if max_val > 0.5:  # Confidence threshold
-                            # Update position
-                            h, w = template.shape
-                            new_x1 = sx1 + max_loc[0]
-                            new_y1 = sy1 + max_loc[1]
-                            new_x2 = new_x1 + w
-                            new_y2 = new_y1 + h
-                            
-                            tracker_obj['last_pos'] = (new_x1, new_y1, new_x2, new_y2)
-                            
-                            # Draw box
-                            cv2.rectangle(frame, (new_x1, new_y1), (new_x2, new_y2), (0, 255, 0), 2)
-                            label = f"Material #{tracker_obj['id']}"
-                            cv2.putText(frame, label, (new_x1, new_y1 - 10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                            active_count += 1
-                        else:
-                            tracker_obj['active'] = False
-            
-            # Display info
-            cv2.putText(frame, f"Frame: {frame_count}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, f"Tracking: {active_count} stacks", (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            
-            cv2.imshow("Material Tracking - 640x640", frame)
-            
-            if cv2.waitKey(30) & 0xFF == ord('q'):
-                break
-        
-        cap.release()
-        cv2.destroyAllWindows()
-        
-        print(f"\n✅ Complete!")
-        
-        def track_and_display(self):
-            """Play video with tracking based on your labels"""
-            cap = cv2.VideoCapture(self.video_path)
-            
-            print("\n🎬 Playing video with tracked stacks...")
-            print("Press 'q' to quit, 'r' to reset trackers")
-            
-            # Find first labeled frame to initialize trackers
-            first_labeled_frame_idx = min([label['frame_idx'] for label in self.manual_labels])
-            cap.set(cv2.CAP_PROP_POS_FRAMES, first_labeled_frame_idx)
-            
-            ret, frame = cap.read()
-            if not ret:
-                print("❌ Couldn't read video")
-                return
-            
-            frame = cv2.resize(frame, (640, 640))
-            
-            # Initialize trackers with your labeled boxes
-            self.initialize_trackers(frame)
-            
-            frame_count = first_labeled_frame_idx
-            material_count = 0
-            
-            while cap.isOpened():
+            if not paused:
                 ret, frame = cap.read()
                 if not ret:
                     break
                 
                 frame_count += 1
-                frame = cv2.resize(frame, (640, 640))
                 
-                # Update all trackers
-                active_count = 0
-                for i, tracker_obj in enumerate(self.trackers):
-                    if tracker_obj['active']:
-                        success, bbox = tracker_obj['tracker'].update(frame)
+                # Resize frame for display
+                display_frame = cv2.resize(frame, display_size)
+                
+                # Run YOLO detection
+                results = self.model(display_frame, conf=self.conf_threshold, iou=self.iou_threshold, verbose=False)
+                
+                # Extract detections
+                detections = []
+                for result in results:
+                    boxes = result.boxes
+                    for box in boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        conf = float(box.conf[0].cpu().numpy())
+                        cls = int(box.cls[0].cpu().numpy())
+                        class_name = self.model.names[cls]
                         
-                        if success:
-                            # Draw tracked box
-                            x, y, w, h = [int(v) for v in bbox]
-                            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                            
-                            label = f"Material #{tracker_obj['id']}"
-                            cv2.putText(frame, label, (x, y - 10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                            active_count += 1
-                        else:
-                            # Tracking lost
-                            tracker_obj['active'] = False
+                        detections.append({
+                            'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                            'confidence': conf,
+                            'class': class_name,
+                            'class_id': cls
+                        })
                 
-                material_count = active_count
+                # Match detections to tracks
+                self.match_detections_to_tracks(detections)
                 
-                # Display info
-                cv2.putText(frame, f"Frame: {frame_count}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-                cv2.putText(frame, f"Tracking: {material_count} stacks", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                # Draw detections with tracking IDs
+                for det in detections:
+                    x1, y1, x2, y2 = det['bbox']
+                    color = colors[det.get('id', 0) % len(colors)]
+                    
+                    # Draw bounding box
+                    cv2.rectangle(display_frame, (x1, y1), (x2, y2), color, 2)
+                    
+                    # Create label
+                    label = f"ID:{det.get('id', '?')} {det['class']} {det['confidence']:.2f}"
+                    
+                    # Draw label background
+                    (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(display_frame, (x1, y1 - label_h - 10), (x1 + label_w, y1), color, -1)
+                    
+                    # Draw label text
+                    cv2.putText(display_frame, label, (x1, y1 - 5),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 
-                cv2.imshow("Material Tracking - 640x640", frame)
+                # Draw info panel
+                info_bg = display_frame.copy()
+                cv2.rectangle(info_bg, (0, 0), (400, 100), (0, 0, 0), -1)
+                display_frame = cv2.addWeighted(display_frame, 0.7, info_bg, 0.3, 0)
                 
-                key = cv2.waitKey(30) & 0xFF
-                if key == ord('q'):
-                    break
-                elif key == ord('r'):
-                    # Reset trackers
-                    self.initialize_trackers(frame)
-                    print("🔄 Trackers reset")
+                cv2.putText(display_frame, f"Frame: {frame_count}/{total_frames}", (10, 30),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(display_frame, f"Detected: {len(detections)} stacks", (10, 60),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(display_frame, f"Tracked: {len(self.tracked_objects)} objects", (10, 90),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Write frame if output video specified
+                if writer:
+                    writer.write(display_frame)
             
-            cap.release()
-            cv2.destroyAllWindows()
+            # Display frame
+            cv2.imshow("YOLO Stack Tracking", display_frame)
             
-            print(f"\n✅ Complete!")
+            # Handle key presses
+            key = cv2.waitKey(1 if not paused else 0) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('p'):
+                paused = not paused
+                print(f"{'⏸️  Paused' if paused else '▶️  Resumed'}")
+            elif key == ord('s'):
+                screenshot_path = f"frame_{frame_count}.jpg"
+                cv2.imwrite(screenshot_path, display_frame)
+                print(f"📸 Saved frame to {screenshot_path}")
+        
+        # Cleanup
+        cap.release()
+        if writer:
+            writer.release()
+        cv2.destroyAllWindows()
+        
+        print(f"\n✅ Processing complete!")
+        print(f"   Total frames processed: {frame_count}")
+        print(f"   Final tracked objects: {len(self.tracked_objects)}")
     
-    def run(self):
+    def run(self, output_path=None, display_size=(1280, 720)):
         """Main execution"""
-        print("🚀 Direct Stack Tracker (No Model)")
-        print("=" * 50)
+        print("🚀 YOLO Stack Tracker with Fine-tuned Model")
+        print("=" * 60)
         
-        # Phase 1: Label
-        self.manual_labeling_phase()
+        # Load model
+        self.load_model()
         
-        # Phase 2: Track
-        self.track_and_display()
+        # Run detection and tracking
+        self.detect_and_track(output_path=output_path, display_size=display_size)
 
 
 # ============= USAGE =============
 if __name__ == "__main__":
-    tracker = DirectStackTracker(
-        video_path="auto_label (1).mp4",
-        num_examples=4
+    # Basic usage
+    tracker = YOLOStackTracker(
+        video_path="Screen Recording 2025-12-30 183422.mp4", #add your video path
+        model_path="stack.pt",
+        conf_threshold=0.5,  # Adjust confidence threshold as needed
+        iou_threshold=0.5    # Adjust IoU threshold for NMS
     )
     
-    tracker.run()
+    # Run WITH output video saved (annotated video will be downloaded)
+    tracker.run(output_path="tracked_output2.mp4", display_size=(1280, 720))
+    
+    # Or run without saving output
+    # tracker.run()
+    
+    # You can also adjust display size for better visualization
+    # tracker.run(display_size=(1920, 1080))  # Full HD
+    # tracker.run(display_size=(640, 640))    # Square format
